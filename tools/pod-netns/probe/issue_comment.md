@@ -3,7 +3,7 @@ Three of the claims in the implementation notes above are contradicted by
 measurement on this host, and one of them was load-bearing for my own
 implementation, where it hid a real defect.
 
-The code is at **`tools/pod-netns`** in this repository: a standalone crate, 30
+The code is at **`tools/pod-netns`** in this repository: a standalone crate, 36
 passing tests, zero warnings, with a runnable C probe behind every number below
 (`tools/pod-netns/probe/`, indexed in its own README).
 
@@ -14,7 +14,8 @@ bytes in both directions:
 
 ```
 outbound   child connect() -> 0; origin received b'GET / HTTP/1.0\r\nHost: origin\r\n\r\n';
-           62 bytes returned including the token; log: "62,32 bytes each way"
+           log: "32,62 bytes each way" (to_far,to_child: the child wrote 32,
+           the origin's 62-byte reply came back, token included)
 inbound    client connected to the backing AF_UNIX socket; the child's accept
            returned fd 6 and read b'GET /inbound HTTP/1.0' (34 bytes relayed)
 ```
@@ -38,12 +39,24 @@ FLAG_SEND            newfd_flags=O_CLOEXEC -> rc=3 OK
 ```
 
 `tools/pod-netns/probe/addfd_clean.c`, one notification per attempt. That detail
-is the whole story: my first probe made four `ADDFD` calls against a *single*
-notification, the first call succeeded and consumed it, and the remaining three
-returned `ENOENT`. I recorded "ENOENT for all flag combinations, therefore
-unavailable" from that and built a pool to route around it. A probe that reports
-a resource as absent because its own earlier call consumed it is a probe bug
-wearing a measurement's clothes, and it cost a design decision.
+is the whole story. My first probe made four `ADDFD` calls against a *single*
+notification, and re-running it now (with its other two claims compiled out) shows
+exactly where it went wrong:
+
+```
+ADDFD flags=flags=0    newfd_flags=0        -> rc=3 OK
+ADDFD flags=flags=0    newfd_flags=O_CLOEXEC -> rc=4 OK
+ADDFD flags=FLAG_SEND  newfd_flags=0        -> rc=5 OK
+ADDFD flags=FLAG_SEND  newfd_flags=O_CLOEXEC -> rc=-1 No such file or directory
+```
+
+Three succeeded and only the fourth failed, because the third call carries
+`SECCOMP_ADDFD_FLAG_SEND`, which answers the pending notification and leaves
+nothing for the fourth to attach a descriptor to. My probe printed "ADDFD WORKED"
+on each of the first three, and I recorded "ENOENT for all flag combinations,
+therefore unavailable" anyway, then built a pool to route around it. A probe that
+reports a resource as absent because its own earlier call consumed it is a probe
+bug wearing a measurement's clothes, and it cost a design decision.
 
 There is no `SECCOMP_ADDFD_FLAG_RECV` in the uapi header, only `FLAG_SEND`, so a
 `SEND|RECV` combination cannot be expressed.
@@ -126,7 +139,7 @@ said, rather than fabricating an address it cannot deliver. I had recorded that
 this file was "readable and writable", which was wrong in the same way the `ADDFD`
 claim was: the probe opened the file and never wrote through it.
 
-## Two more traps, since they cost me the same kind of wrong turn
+## Three more traps, since they cost me the same kind of wrong turn
 
 **`seccomp_notif` must be zeroed before every `NOTIF_RECV`.** The kernel rejects a
 struct with any field set, and `EINVAL` is indistinguishable from a spent
@@ -155,6 +168,29 @@ cost me the most time, and nothing in the notes warns about it.
 
 ## What I did not do
 
+- **The SOCKS5 and HTTP CONNECT paths are unit-tested only, never run end to
+  end.** They are tested against in-memory fakes, which proves the bytes on the
+  wire are well formed but not that a flow completes through a real proxy. I
+  could not close that gap here: `connect` to `127.0.0.1` is `EACCES` for every
+  process in this cage, so a test proxy on loopback is unreachable from the
+  supervisor, and `--proxy` has no `AF_UNIX` form because it takes `HOST:PORT`
+  and a socket path is not one. The symptom to expect if you try it anyway:
+
+  ```
+  pod-netns --verbose --connect 127.0.0.1:P --upstream some.name:443 \
+      --proxy 127.0.0.1:1080 --socks5 -- ./client
+    connect -> -1 (Connection refused)
+    pod-netns:   connect 127.0.0.1:P -> some.name:443 via SOCKS5 127.0.0.1
+                 failed: Permission denied (os error 13)
+  ```
+
+  Note the child gets `ECONNREFUSED`, not `EACCES`. The `EACCES` happened in the
+  supervisor's own dial and is translated at the point the child is answered, so
+  a reader chasing the child's errno will look for the wrong restriction.
+  `probe/s5proxy.c` is a working SOCKS5 server that records the destination it
+  was asked for; it cannot bind a TCP port here, which is the gap itself rather
+  than a workaround for it. On a host with a reachable proxy this is the first
+  thing to add a test for.
 - No `doctor` subcommand. The cage facts are in the README, but a machine-readable
   capability probe is the right shape for this and I did not build it.
 - No `sendto`/`sendmsg`/`sendmmsg` interception, so a program that writes with
@@ -171,8 +207,12 @@ cost me the most time, and nothing in the notes warns about it.
 `tests/pod_netns_seccomp.rs` is cited three times, with a description of what each
 test asserts. It is not in the repository. So is the seccomp backend: `grep` for
 `USER_NOTIF`, `NOTIF_ADDFD` or `SECCOMP_IOCTL` across `src/` and `tests/` returns
-nothing, and there is no `pod_netns` binary. `src/vnet/doctor.rs` exists and
-probes `unshare`, `/dev/net/tun` and `ptrace_scope`, but no seccomp capability.
+nothing, and there is no `pod_netns` binary (`Cargo.toml` declares no `[[bin]]`;
+the only binary is `cfrs`). `src/vnet/doctor.rs` exists and probes `unshare` on
+three flags, a set of `bind` calls across address families, `/dev/net/tun`,
+`/dev/vsock`, `NoNewPrivs`, `CapEff` and the architecture. It reports a `Seccomp`
+probe by reading `/proc/self/status`, which is the capability this crate needs,
+so it is the wrong file to consult for whether the seccomp *backend* exists.
 
 I am not claiming that is what was intended, only what is there now. My
 measurements above are all from this host and reproducible with the probes in
@@ -183,3 +223,13 @@ right about `setsockopt` and I shipped the bug anyway, and my own code carried t
 false measurement records that shaped real design decisions. Those are fixed, and
 the record now names what each probe got wrong, so the next person does not
 rediscover them the expensive way.
+
+A third correction, to a number in this comment as posted above. The two counts
+on the end-of-flow log line were being assigned to each other's fields, so the
+`62,32` I reported is really `32,62` in `to_far,to_child` order: the child wrote 32
+bytes to the origin and read 62 back. The count is not a matter of opinion, the
+two fields were literally crossed in `relay::relay`, and the reason it survived is
+worth recording: both directions still printed a plausible pair of numbers, so
+nothing failed and no test looked at which field held which. A flow of unequal
+sizes in the two directions, with a test that names the direction, is what it
+takes to catch that, and there is one now.

@@ -319,4 +319,79 @@ mod tests {
             "bytes read past the reply are the tunnel's first bytes and must be handed back"
         );
     }
+
+    /// `http_connect` is the default route (`Route::Proxy` with `socks5` off),
+    /// so it needs the same three guarantees the SOCKS5 tests assert: the exact
+    /// request on the wire, the over-read bytes handed back, and a refusal
+    /// carrying its reason.
+    #[test]
+    fn http_connect_writes_the_request_curl_would() {
+        let mut f = Fake {
+            input: b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec(),
+            pos: 0,
+            output: Vec::new(),
+        };
+        let leftover = http_connect(&mut f, "db.internal", 5432).unwrap();
+        let req = String::from_utf8(f.output).unwrap();
+        assert!(
+            req.starts_with("CONNECT db.internal:5432 HTTP/1.1\r\n"),
+            "a non-standard proxy needs the method line curl sends, got: {req:?}"
+        );
+        assert!(
+            req.contains("\r\nHost: db.internal:5432\r\n"),
+            "the Host header is required by RFC 7231 for CONNECT, got: {req:?}"
+        );
+        assert!(req.ends_with("\r\n\r\n"), "the request must end the headers, got: {req:?}");
+        assert!(leftover.is_empty(), "nothing past the header means nothing to hand back");
+    }
+
+    /// A proxy that sends its 200 and the first tunnel bytes in one write must
+    /// not lose the payload to header buffering.
+    #[test]
+    fn http_connect_yields_bytes_sent_past_the_header() {
+        let script = b"HTTP/1.1 200 Connection established\r\n\r\nPAYLOAD".to_vec();
+        let mut f = Fake { input: script, pos: 0, output: Vec::new() };
+        let leftover = http_connect(&mut f, "1.2.3.4", 80).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&leftover), "PAYLOAD",
+            "bytes read past the headers are the tunnel's first bytes and must be handed back"
+        );
+    }
+
+    #[test]
+    fn http_connect_refusal_is_reported_with_the_status_line() {
+        for (status, expect) in [
+            ("HTTP/1.1 403 Forbidden", "403"),
+            ("HTTP/1.1 407 Proxy Authentication Required", "407"),
+            ("HTTP/1.1 502 Bad Gateway", "502"),
+        ] {
+            let mut f = Fake {
+                input: format!("{status}\r\n\r\n").into_bytes(),
+                pos: 0,
+                output: Vec::new(),
+            };
+            let e = http_connect(&mut f, "h", 1).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused, "{status}");
+            assert!(e.to_string().contains(expect), "{status}: got {e}");
+        }
+    }
+
+    /// A 2xx that is not 200 is still a success to a proxy, but this tool keys
+    /// off " 200". Pin which shapes are accepted so a change here is deliberate.
+    #[test]
+    fn http_connect_accepts_only_a_200_status() {
+        let mut f = Fake {
+            input: b"HTTP/1.0 200 OK\r\n\r\n".to_vec(),
+            pos: 0,
+            output: Vec::new(),
+        };
+        assert!(http_connect(&mut f, "h", 1).is_ok(), "HTTP/1.0 200 must be accepted");
+
+        let mut f = Fake {
+            input: b"HTTP/1.1 204 No Content\r\n\r\n".to_vec(),
+            pos: 0,
+            output: Vec::new(),
+        };
+        assert!(http_connect(&mut f, "h", 1).is_err(), "204 is not a CONNECT success");
+    }
 }

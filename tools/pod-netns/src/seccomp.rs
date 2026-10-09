@@ -14,14 +14,18 @@
 //! 1. A task may hold only ONE `USER_NOTIF` listener; a second
 //!    `SECCOMP_SET_MODE_FILTER|NEW_LISTENER` returns EBUSY. So every syscall
 //!    we care about goes in one filter and is dispatched on `seccomp_data.nr`.
+//!    Measured in `probe/one_listener.c`, which also covers the case the claim
+//!    did not: a child that INHERITED the filter is refused a listener of its
+//!    own with EBUSY as well, so the limit follows the filter across fork
+//!    rather than being a property of one process.
 //!
 //! 2. `seccomp_notif` must be ALL ZERO on entry to every `NOTIF_RECV`. The
 //!    kernel rejects a struct with any field set, returning EINVAL, and that
 //!    EINVAL is indistinguishable from a spent listener. Measured: id, pid,
 //!    flags, `data.nr` and the bytes at offsets 16/20/24 each fail; all zeros
-//!    succeeds. So `recv` below zeroes a fresh struct every call. Reusing one
-//!    struct across calls poisons the second RECV with the kernel's own output
-//!    and manufactures a fake ceiling of exactly one notification.
+//!    succeeds. So `recv_notification` below zeroes a fresh struct every call.
+//!    Reusing one struct across calls poisons the second RECV with the kernel's
+//!    own output and manufactures a fake ceiling of exactly one notification.
 //!
 //! 3. One listener serves UNLIMITED notifications. Measured 64 of 64 served
 //!    with no errors, at a 0 us and a 2000 us gap between the child's calls,
@@ -30,21 +34,22 @@
 //!    was the bug in note 2, and it wrongly retired `getsockname`, which does
 //!    work after `bind`. Hence the single-threaded notification loop in `run`.
 //!
-//! 4. The supervisor cannot write the child's memory at all. Measured:
-//!    `/proc/<pid>/mem` opens O_RDONLY but O_WRONLY and O_RDWR both fail
-//!    EACCES, because the kernel gates write access on CAP_SYS_RESOURCE and
-//!    CapEff is 0 in this cage. `process_vm_writev` is EPERM and
-//!    `ptrace(PTRACE_ATTACH)` is EPERM. Reading IS allowed, so the child's
-//!    sockaddr can be recovered on the way in, but nothing can be put back.
+//! 4. The supervisor cannot write the child's memory at all. Measured in
+//!    `probe/memrw.c`: `/proc/<pid>/mem` opens O_RDONLY but O_WRONLY and O_RDWR
+//!    both fail EACCES, because the kernel gates write access on
+//!    CAP_SYS_RESOURCE and CapEff is 0 in this cage. `process_vm_readv` and
+//!    `process_vm_writev` are both EPERM, and `ptrace(PTRACE_ATTACH)` is EPERM.
+//!    Reading through `/proc/<pid>/mem` IS allowed, so the child's sockaddr can
+//!    be recovered on the way in, but nothing can be put back.
 //!
 //!    An earlier version of this file claimed `/proc/<pid>/mem` was
 //!    "readable and writable". The write half was wrong: the probe opened the
-//!    file and never wrote through it (`probe/` in the sibling `ts` tree, or
-//!    rerun the three syscalls). The consequence is concrete: `getsockname`
-//!    cannot be answered by handing the child its own address, because there is
-//!    no route to put those bytes in the child's buffer. The `getsockname` arm
-//!    in `main.rs` probes for the write route and passes the call through when
-//!    it is closed, rather than fabricating an address it cannot deliver.
+//!    file and never wrote through it (rerun `probe/memrw.c`). The consequence
+//!    is concrete: `getsockname` cannot be answered by handing the child its own
+//!    address, because there is no route to put those bytes in the child's
+//!    buffer. The `getsockname` arm in `main.rs` probes for the write route and
+//!    passes the call through when it is closed, rather than fabricating an
+//!    address it cannot deliver.
 //!
 //! 5. `SECCOMP_IOCTL_NOTIF_ADDFD` WORKS in this cage, in all four
 //!    (flags, newfd_flags) combinations. An earlier note here claimed it
@@ -61,10 +66,22 @@
 //!    control. Migrating is a deliberate piece of work, not a limitation.
 //!
 //! Also measured and deliberately not relied on: `SECCOMP_GET_NOTIF_SIZES`
-//! returns EINVAL in this kernel under both the bare-`3` and `_IO('!',3)`
-//! spellings, so it cannot be used to detect a stale uapi header. The
-//! compiled-in ioctl command number is correct: a sweep of the encoded struct
-//! size from 16 to 160 accepted nothing but 80 bytes.
+//! cannot be used to detect a stale uapi header. Correctly encoded as
+//! `_IOWR('!', 0, struct seccomp_notif_sizes)`, it returns EINVAL on a live
+//! listener fd in this kernel.
+//!
+//! An earlier version of this note said it "returns EINVAL under both the
+//! bare-`3` and `_IO('!', 3)` spellings". That premise was wrong rather than
+//! its errno: `SECCOMP_GET_NOTIF_SIZES` is not the bare number 3, and on an
+//! ordinary fd every seccomp command is ENOTTY because the ioctl handler is
+//! reachable only through the listener fd. So the bare-3 result says nothing
+//! about the feature, and reading it as EINVAL credited the probe with a
+//! measurement it had not made. See `probe/notifsizes.c`.
+//!
+//! That same probe confirms the command numbers this crate compiles in are
+//! right: sweeping the encoded size field of `NOTIF_RECV` from 4 to 160 on a
+//! real listener fd, exactly one of 40 encodings is recognised, at size 80,
+//! which is the size libc encodes.
 
 
 use std::io;
@@ -107,6 +124,11 @@ use std::os::unix::io::RawFd;
 /// submitted operations itself and there is no syscall left to mediate. That is a
 /// real gap, stated rather than papered over.
 ///
+/// `offsetof(struct seccomp_data, nr)`. `nr` is the first member of the struct, so
+/// the offset is 0, and the BPF load in `build_program` reads it with `BPF_ABS`
+/// from there.
+pub const SECKCOMP_DATA_NR_OFFSET: u32 = 0;
+
 /// Order does not matter: a miss falls through to the next comparison. An
 /// earlier note here claimed the order was load-bearing, which was a misreading
 /// of a jump-offset bug rather than a property of seccomp. See `build_program`.
@@ -127,7 +149,7 @@ pub const TARGETS: &[libc::c_long] = &[
 /// derives from `TARGETS`; this is the same predicate for callers that want to
 /// ask without walking the program.
 pub fn is_target(nr: i64) -> bool {
-    TARGETS.iter().any(|&t| t == nr as libc::c_long)
+    TARGETS.contains(&(nr as libc::c_long))
 }
 
 /// What the child asked for, as recovered from its own memory.
@@ -190,7 +212,7 @@ pub fn read_family(pid: i32, addr: u64) -> io::Result<u8> {
     let mem = std::fs::File::open(&path)?;
     use std::os::unix::fs::FileExt;
     let mut buf = [0u8; 2];
-    let n = mem.read_at(&mut buf, addr as u64)?;
+    let n = mem.read_at(&mut buf, addr)?;
     if n < 2 {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short family read"));
     }
@@ -208,7 +230,7 @@ pub fn read_sockaddr(pid: i32, addr: u64, len: u64) -> io::Result<Endpoint> {
     use std::os::unix::fs::FileExt;
     let mut buf = [0u8; 28];
     let want = std::cmp::min(len as usize, buf.len());
-    let n = mem.read_at(&mut buf[..want], addr as u64)?;
+    let n = mem.read_at(&mut buf[..want], addr)?;
     if n < 8 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "short sockaddr read"));
     }
@@ -278,7 +300,7 @@ pub fn write_sockaddr(pid: i32, addr: u64, maxlen: u64, ep: &Endpoint) -> io::Re
     let path = format!("/proc/{}/mem", pid);
     let mem = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
     use std::os::unix::fs::FileExt;
-    mem.write_at(&buf, addr as u64)?;
+    mem.write_at(&buf, addr)?;
     Ok(())
 }
 
@@ -287,7 +309,7 @@ pub fn write_len(pid: i32, addr: u64, len: u64) -> io::Result<()> {
     let path = format!("/proc/{}/mem", pid);
     let mem = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
     use std::os::unix::fs::FileExt;
-    mem.write_at(&(len as u32).to_ne_bytes(), addr as u64)?;
+    mem.write_at(&(len as u32).to_ne_bytes(), addr)?;
     Ok(())
 }
 
@@ -303,7 +325,7 @@ pub fn read_len(pid: i32, addr: u64) -> io::Result<u64> {
     let mem = std::fs::File::open(&path)?;
     use std::os::unix::fs::FileExt;
     let mut buf = [0u8; 4];
-    let n = mem.read_at(&mut buf, addr as u64)?;
+    let n = mem.read_at(&mut buf, addr)?;
     if n < 4 {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short socklen_t read"));
     }
@@ -449,10 +471,13 @@ impl Notifier {
 
     /// Pass the listener fd to the supervisor over `sock` using SCM_RIGHTS.
     ///
-    /// The supervisor cannot see the fd the child created, because a descriptor
-    /// number is per-process. SCM_RIGHTS is the only route that copies a
-    /// descriptor between processes without `/proc/<pid>/fd`, which is ENXIO in
-    /// this cage.
+    /// The supervisor cannot use the child's own fd number, because a descriptor
+    /// number is per-process and the two processes are looking at different
+    /// tables. `/proc/<pid>/fd` is openable in this cage (measured:
+    /// `probe/memrw.c`), so a supervisor could *borrow* a descriptor the child
+    /// holds, but that is the wrong direction: it cannot put one into the
+    /// child's table. SCM_RIGHTS and `SECCOMP_IOCTL_NOTIF_ADDFD` are the two
+    /// routes that do that, and this is the one that works before exec.
     pub fn send_to(&self, sock: RawFd) -> io::Result<()> {
         let mut cmsg_buf = [0u8; 64];
         // A one-byte payload is required: sendmsg with an empty iovec still
@@ -597,7 +622,11 @@ fn build_program() -> Vec<libc::sock_filter> {
     let mut prog: Vec<libc::sock_filter> = Vec::with_capacity(2 + 2 * n);
     prog.push(bpf_stmt(
         (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
-        std::mem::size_of::<libc::seccomp_data>() as u32 * 0, // nr is at offset 0
+        // offsetof(struct seccomp_data, nr), which is 0: nr is the first
+        // field. Spelled as a plain 0 because the arithmetic that used to be
+        // written here (`size_of::<seccomp_data>() * 0`) always evaluated to
+        // zero and read as though it computed something.
+        SECKCOMP_DATA_NR_OFFSET,
     ));
     for (idx, &target) in TARGETS.iter().enumerate() {
         let j = idx + 1; // 1-based position, and also the f[] index
@@ -669,7 +698,7 @@ mod tests {
         let prog = build_program();
         for &t in TARGETS {
             assert_eq!(
-                action_for(&prog, t as i64),
+                action_for(&prog, t),
                 USER_NOTIF,
                 "syscall {t} must be intercepted, but the filter lets it through"
             );
@@ -704,7 +733,7 @@ mod tests {
         assert_eq!(prog[n + 2].k, ALLOW, "f[n+2] must be RET ALLOW");
         for (idx, &target) in TARGETS.iter().enumerate() {
             let ins = prog[idx + 1];
-            assert_eq!(ins.k as i64, target as i64, "f[{}] compares the wrong syscall", idx + 1);
+            assert_eq!(ins.k as i64, target, "f[{}] compares the wrong syscall", idx + 1);
         }
     }
 
@@ -714,11 +743,11 @@ mod tests {
     #[test]
     fn is_target_agrees_with_the_filter() {
         for &t in TARGETS {
-            assert!(is_target(t as i64), "{t} is in TARGETS but not reported");
-            assert_eq!(action_for(&build_program(), t as i64), USER_NOTIF);
+            assert!(is_target(t), "{t} is in TARGETS but not reported");
+            assert_eq!(action_for(&build_program(), t), USER_NOTIF);
         }
         assert!(!is_target(0), "syscall 0 is read and is not intercepted");
-        assert!(!is_target(libc::SYS_execve as i64));
+        assert!(!is_target(libc::SYS_execve as libc::c_long));
     }
 
     /// The regression control, written so it fails against the old builder: it
@@ -730,8 +759,7 @@ mod tests {
     fn a_miss_falls_through_to_the_next_comparison() {
         let prog = build_program();
         let n = TARGETS.len();
-        for j in 1..=n {
-            let ins = prog[j];
+        for (j, ins) in prog.iter().enumerate().take(n + 1).skip(1) {
             if j < n {
                 assert_eq!(
                     ins.jf, 0,

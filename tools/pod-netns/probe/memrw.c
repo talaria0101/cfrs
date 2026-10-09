@@ -7,8 +7,17 @@
  *   open(/proc/<pid>/mem, O_RDONLY)   ok
  *   open(/proc/<pid>/mem, O_WRONLY)   EACCES
  *   open(/proc/<pid>/mem, O_RDWR)     EACCES
- *   process_vm_writev                 EPERM
- *   ptrace(PTRACE_ATTACH)             EPERM
+ *   process_vm_readv                 EPERM
+ *   process_vm_writev                EPERM
+ *   ptrace(PTRACE_ATTACH)            EPERM
+ *
+ * It also measures something the crate's docs had asserted three times without
+ * ever checking, and got wrong: /proc/<pid>/fd is NOT ENXIO here. It opens, and
+ * opening an entry in it succeeds, so a supervisor CAN borrow a descriptor the
+ * child already holds. What that does not give is any way to put a descriptor
+ * INTO the child's table, which is why SCM_RIGHTS and ADDFD are the routes that
+ * matter for this design. The claim has been corrected in src/main.rs and
+ * src/seccomp.rs; this probe is what it is corrected against.
  *
  * The kernel gates the write path on CAP_SYS_RESOURCE and CapEff is 0 here.
  * Reading is allowed, so a supervisor CAN recover the sockaddr the child is
@@ -82,7 +91,12 @@ int main(void)
 			close(fd);
 	}
 
-	say("\nthe two alternative routes into the child's memory:");
+	say("\nthe alternative routes into the child's memory:");
+	errno = 0;
+	long r = process_vm_readv(p, &(struct iovec){ .iov_base = NULL, .iov_len = 0 }, 1,
+				  &(struct iovec){ .iov_base = NULL, .iov_len = 0 }, 1, 0);
+	say("  process_vm_readv       -> %ld  %s", r, r < 0 ? strerror(errno) : "OK");
+
 	errno = 0;
 	long w = process_vm_writev(p, &(struct iovec){ .iov_base = NULL, .iov_len = 0 }, 1,
 				   &(struct iovec){ .iov_base = NULL, .iov_len = 0 }, 1, 0);
@@ -93,6 +107,31 @@ int main(void)
 	say("  ptrace(PTRACE_ATTACH)  -> %ld  %s", t, t < 0 ? strerror(errno) : "OK");
 	if (t == 0)
 		ptrace(PTRACE_DETACH, p, NULL, NULL);
+
+	/* The third route into the child's state: /proc/<pid>/fd, which a
+	 * supervisor would use to borrow or replace a descriptor it already owns.
+	 * This is measured rather than recalled because the crate's docs assert
+	 * ENXIO in three places and nothing had ever opened it. If it were
+	 * readable, SCM_RIGHTS would not be the only way to move a descriptor
+	 * across, and the design note that says so would be wrong.
+	 */
+	char fdpath[64];
+	snprintf(fdpath, sizeof fdpath, "/proc/%d/fd", p);
+	errno = 0;
+	int dfd = open(fdpath, O_RDONLY | O_DIRECTORY);
+	say("\n/proc/<pid>/fd, the route to another process's descriptors:");
+	say("  open(%s) -> %2d  %s", fdpath, dfd, dfd < 0 ? strerror(errno) : "OK");
+	if (dfd >= 0) {
+		/* Being able to open the directory is not being able to use it, so
+		 * try the operation that would actually replace SCM_RIGHTS. */
+		errno = 0;
+		int borrowed = openat(dfd, "0", O_RDONLY);
+		say("  openat(fd dir, \"0\")  -> %2d  %s", borrowed,
+		    borrowed < 0 ? strerror(errno) : "OK");
+		if (borrowed >= 0)
+			close(borrowed);
+		close(dfd);
+	}
 
 	say("\nverdict:");
 	if (access("/proc/self/status", R_OK) == 0) {

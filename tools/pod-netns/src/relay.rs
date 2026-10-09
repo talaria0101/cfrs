@@ -28,22 +28,23 @@
 //!   the number happens to refer to a real connected socketpair we own the other
 //!   end of. No new fd is ever created after exec.
 //!
-//! That only works because the pool fds are real and known, which is why `Pool`
-//! hands back the actual descriptor rather than a slot index.
+//! That only works because the pool fds are real and known, which is why
+//! `main::Pool` hands back the actual descriptor rather than a slot index.
 //!
 //! ## The filter must not apply to the supervisor
 //!
-//! `install` is called in the supervisor's own process, so the filter is in scope
-//! for every thread the tool creates. That matters because the filter notifies
-//! on `socket`, `bind` and `connect`, and the tool makes those calls itself when
-//! it dials an upstream. A notifying syscall blocks its thread until someone
-//! services the listener, and the only listener is the supervisor thread that is
-//! itself blocked, so the tool deadlocks: measured in `probe/selfdl.c`, where a
-//! process whose own `connect` notifies never returns from that `connect`.
+//! The filter notifies on `socket`, `bind` and `connect`, and the tool makes
+//! those calls itself when it dials an upstream. A notifying syscall blocks its
+//! thread until someone services the listener, and the only listener is the
+//! supervisor thread that is itself blocked, so a filtered supervisor deadlocks
+//! on its own dial: measured in `probe/selfdl.c`, where a process whose own
+//! `connect` notifies never returns from that `connect` (exit 124 under
+//! `timeout 10`).
 //!
 //! The fix is structural rather than clever. The filter is installed into the
 //! CHILD by a pre-exec hook, so the supervisor's threads are never filtered and
-//! can dial freely. `install` is therefore called from the child, not the parent.
+//! can dial freely. `Notifier::install` is called from inside `pre_exec`, which
+//! runs in the forked child before `exec`, and never in the parent.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -289,14 +290,19 @@ pub fn relay(child_side: UnixStream, flow: Flow) -> Counted {
         n
     });
 
-    let to_far = up.join().unwrap_or(0);
-    let to_child = down.join().unwrap_or(0);
+    // `up` carries far -> child and `down` carries child -> far, so each join is
+    // assigned to the direction its thread actually pumps. Crossing these two
+    // is invisible in the totals, since both counts still get printed, and it
+    // makes the log line say the opposite of what happened: a child that wrote
+    // 32 bytes and read 62 was logged as 62,32 "each way", which reads as if
+    // the two were equal.
+    let to_child = up.join().unwrap_or(0);
+    let to_far = down.join().unwrap_or(0);
     Counted { to_far, to_child }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     /// A pair of in-memory byte queues standing in for the two sockets, so the
     /// relay's ordering behaviour is testable without a network.
@@ -349,6 +355,50 @@ mod tests {
         let _ = b.read(&mut buf);
         got.extend_from_slice(&buf);
         assert_eq!(&got, b"PAYLOAD");
+    }
+
+    /// The two counts are what the end-of-flow log line prints, so they have to
+    /// be in the direction their names claim. A child that writes 4 bytes and
+    /// reads 10 must log `to_child=10, to_far=4`. Assigning the two join results
+    /// the wrong way round still prints two plausible numbers, which is why this
+    /// was shipped and stayed shipped: nothing failed, the totals just quietly
+    /// described the opposite of what happened.
+    #[test]
+    fn the_counts_name_the_direction_they_pumped() {
+        // Both halves of the pair must be closed for both relay threads to see
+        // EOF: `child_peer` stands in for the child process, and dropping it
+        // after writing is what ends the far -> child direction.
+        let (child_side, mut child_peer) = UnixStream::pair().unwrap();
+
+        // Distinct lengths per direction, so a swap cannot be mistaken for
+        // symmetry: the far side delivers 10 bytes and EOFs, the child writes 4.
+        let far = Flow {
+            read: Box::new(Pipe::new(b"0123456789")),
+            write: Box::new(Pipe::new(b"")),
+            prefetched: Vec::new(),
+        };
+
+        // Stand in for the child: read what the far side sends, write 4 bytes back,
+        // then close. Reading first is what keeps the far -> child direction
+        // alive: if the socket closes before relay writes to it, the write
+        // fails with EPIPE and the count comes back as 0.
+        let reader = std::thread::spawn(move || {
+            use std::io::Read as _;
+            use std::io::Write as _;
+            let mut got = [0u8; 10];
+            child_peer.read_exact(&mut got).unwrap();
+            assert_eq!(&got, b"0123456789", "the far side's bytes must arrive in order");
+            child_peer.write_all(b"abcd").unwrap();
+            child_peer.flush().unwrap();
+        });
+
+        let counted = relay(child_side, far);
+        reader.join().unwrap();
+
+        assert_eq!(counted.to_child, 10, "the 10 far bytes went TO THE CHILD");
+        assert_eq!(counted.to_far, 4, "the 4 child bytes went TO THE FAR SIDE");
+        // And the order the end-of-flow log line prints them in.
+        assert_eq!(counted.to_string(), "4,10");
     }
 
     #[test]

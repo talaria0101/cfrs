@@ -3,15 +3,16 @@
 //! Run it in front of any program, static or dynamic:
 //!
 //! ```sh
-//! pod-netns --listen 8080 -- ./my-program arg1
+//! pod-netns --listen 127.0.0.1:8080 -- ./my-program arg1
 //! ```
 //!
 //! Why this exists, and why it is not an LD_PRELOAD shim: the target cage
 //! refuses `unshare(CLONE_NEWNET)`, has no `/dev/net/tun`, denies `ptrace`, and
 //! the interesting programs are statically linked, so there is no dynamic
-//! loader to interpose into. That rules out every design in the eight
-//! netns/proxy projects studied, all of which redirect traffic by owning a TUN
-//! device inside a namespace.
+//! loader to interpose into. That rules out every design in the netns/proxy
+//! projects studied (`nsproxy`, `socksns`, `proxy-ns`, `netns-proxy`,
+//! `netns_tcp_bridge`), all of which redirect traffic by owning a TUN device
+//! inside a namespace.
 //!
 //! What is left is `SECCOMP_RET_USER_NOTIF`, which the cage does permit: the
 //! kernel offers us each matching syscall and lets us choose the result. The
@@ -21,12 +22,17 @@
 //! ## What it does
 //!
 //! 1. pre-creates a pool of `AF_UNIX` socket pairs and clears `CLOEXEC`, so the
-//!    child inherits real fds. This is what removes the need for
-//!    `SECCOMP_IOCTL_NOTIF_ADDFD`, which is unavailable here.
-//! 2. installs one seccomp user-notify filter covering bind/connect/getsockname.
+//!    child inherits real fds. This predates a measurement, not an obstacle:
+//!    `SECCOMP_IOCTL_NOTIF_ADDFD` turns out to work in this cage in all four
+//!    flag combinations, so the pool is a redundant route rather than a
+//!    necessary one. Migrating to ADDFD is listed as not-implemented in the
+//!    README.
+//! 2. installs one seccomp user-notify filter covering the syscalls in
+//!    `seccomp::TARGETS`: `socket`, `bind`, `connect`, `getsockname`, `listen`,
+//!    `accept`, `accept4`, `setsockopt`.
 //! 3. on a matching syscall, reads the child's real sockaddr from
 //!    `/proc/<child>/mem` — the only route that works, since
-//!    `process_vm_readv` is EPERM and `/proc/<pid>/fd` is ENXIO — and answers
+//!    `process_vm_readv` is EPERM — and answers
 //!    with success, splicing the child's fd onto a real `AF_UNIX` connection.
 //! 4. `exec`s the target with the inherited pool in place.
 //!
@@ -148,7 +154,8 @@ SCOPE, and this is measured rather than guessed:
     process binding the same port will not collide, because nothing was ever
     added to the kernel's port tables. Everything not intercepted is the
     kernel's own behaviour, and in this cage that usually means EPERM.
-    CONSTRAINTS.md records the measurements behind every claim here.
+    README.md records the measurements behind every claim here, and probe/ has
+    a runnable probe per measurement.
 ";
 
 fn parse_opts() -> Result<Opts, String> {
@@ -707,8 +714,8 @@ passing it through"
                 }
                 x if x == libc::SYS_bind => {
                     // Read the address the child actually asked for. This is the
-                    // only way to know it: process_vm_readv is EPERM here and
-                    // /proc/<pid>/fd is ENXIO, but /proc/<pid>/mem is readable.
+                    // only way to know it: process_vm_readv is EPERM here, while
+                    // /proc/<pid>/mem is readable.
                     let ep = match seccomp::read_sockaddr(pid, sp, sl) {
                         Ok(e) => e,
                         Err(e) => {

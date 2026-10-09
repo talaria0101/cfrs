@@ -37,18 +37,61 @@ notifications served, with no errors.
 5. for `--listen`, binds an `AF_UNIX` socket, and `accept` hands the child a
    pooled fd carrying the queued connection.
 
+### The listener handover has an ordering dependency
+
+Step 2 installs the filter **before** the `SCM_RIGHTS` send, because the listener
+fd only exists once the filter is installed. That works only because `sendmsg` is
+not in `TARGETS`, so the send is not notified and passes straight through to the
+kernel.
+
+This is worth stating because it is a trap, not an implementation detail. A filter
+that also intercepted `sendmsg` or `sendto` would notify on the handover itself,
+and the supervisor is not yet in its receive loop, so the child would block in
+`sendmsg` before `exec` and never start. The same trap appears in the other
+direction: a filter installed in the supervisor instead of the child deadlocks on
+the supervisor's own socket calls, which is finding 3 below.
+
+So there are two orderings that both look fine and one that hangs, and the
+non-obvious one is the current code. `TARGETS` is documented at its definition in
+`src/seccomp.rs`, and adding a syscall to it needs the handover re-checked.
+
 ## Verified in this cage
 
-Both directions carry real bytes, with byte counts:
+Both directions carry real bytes, and the log accounts for them in each
+direction. Reproduce with:
 
 ```
-outbound   child connect() -> 0; origin received b'GET / HTTP/1.0\r\n...';
-           62 bytes came back including the token; log: "62,32 bytes each way"
-inbound    client connected to the backing AF_UNIX socket; the child's accept
-           returned fd 6 and read b'GET /inbound HTTP/1.0' (34 bytes)
+# outbound, with an AF_UNIX origin on /tmp/pn-verify.sock that answers HELLO
+pod-netns --verbose --connect 127.0.0.1:28070 \
+    --upstream-unix /tmp/pn-verify.sock -- testdata/relayer 28070
+
+  connect -> 0 (ok)
+  wrote 32 bytes
+  got reply with HELLO
+  read 62 bytes
+  flow 127.0.0.1:28070 -> /tmp/pn-verify.sock (AF_UNIX) closed, 32,62 bytes each way
 ```
 
-`cargo test --release`: 31 tests, 0 failures, 0 compiler warnings.
+The two numbers are `to_far,to_child`: 32 bytes the child wrote to the origin, 62
+the origin sent back.
+
+```
+# inbound, with a client on the backing socket
+pod-netns --verbose --listen 127.0.0.1:28071 -- testdata/srv 28071
+  # then: connect /tmp/pod-netns-4-28071.sock and send a request
+
+  accept ok fd=6
+  peer said: GET /inbound HTTP/1.0
+```
+
+The exact byte counts depend on the fixture, so read them as "the counts agree in
+both directions and the token came back", not as constants. Here `32` is what
+`testdata/relayer` writes and `62` is the length of the origin's reply, which is
+the 62-byte HTTP response the test origin in `the_relay_carries_bytes_in_both_
+directions` sends. A different fixture reply gives a different number. Those tests
+assert the property rather than a constant.
+
+`cargo test --release`: 36 tests, 0 failures, 0 compiler warnings, clippy clean.
 
 ## Options
 
@@ -58,7 +101,7 @@ inbound    client connected to the backing AF_UNIX socket; the child's accept
 | `--connect ADDR:PORT` | the child may `connect` this; the flow is carried to `--upstream` |
 | `--upstream HOST:PORT` | where a proxied flow goes, by TCP |
 | `--upstream-unix PATH` | where a proxied flow goes, by `AF_UNIX` socket |
-| `--proxy HOST:PORT` | send the flow through this HTTP CONNECT or SOCKS5 proxy |
+| `--proxy HOST:PORT` | send the flow through this HTTP CONNECT or SOCKS5 proxy. **The address must not be loopback in this cage**: `connect` to `127.0.0.1` is `EACCES` for every process here, so the supervisor cannot reach a proxy on loopback. Its dial fails, and the child's `connect` is then answered `ECONNREFUSED`. A proxy on a routable address works. |
 | `--socks5` | speak SOCKS5 to `--proxy`, rather than HTTP CONNECT |
 | `--no-proxy` | dial `--upstream` directly |
 | `--pool N` | pre-inherited socket pairs (default 16) |
@@ -75,6 +118,18 @@ This is **not** a network namespace, and the difference is observable:
   usually means `EPERM`.
 - UDP is not proxied. UDP `send` is `EPERM` here, so no datagram can leave the
   host to be relayed, and `SOCK_STREAM` is the only thing claimed.
+- **loopback is unreachable from the supervisor.** `connect` to `127.0.0.1` is
+  `EACCES` for every process in this cage, while `connect` to a routable address
+  succeeds. So `--proxy` and `--upstream` only work against non-loopback
+  addresses: those are dialed by the supervisor, whose `connect` hits the
+  restriction. `--connect` is *not* affected, because the child's own `connect`
+  is faked in userspace and never reaches the network stack. The end-to-end
+  outbound test uses `--connect 127.0.0.1:28099` against a unix origin. What the
+  child sees when a supervisor-side dial fails is `ECONNREFUSED`, not the
+  underlying `EACCES`: the supervisor reports the failed dial to the child as a
+  refusal. `--upstream-unix` and `--listen` are unaffected, because `AF_UNIX` is
+  not covered by the restriction, which is why the end-to-end tests use a unix
+  origin rather than a local TCP one.
 - `io_uring` is a real hole **on any host that permits it**: the kernel performs
   the submitted operation itself, so there is no syscall left for a filter to
   mediate. Here `io_uring_setup` returns `EPERM`, which is why this has not bitten.
@@ -138,8 +193,18 @@ symptom was a name-resolution error pointing at DNS rather than at a proxy. Meas
 on the same option: bare, `setsockopt(IPPROTO_IP, IP_TOS)` returns 0; through the
 socketpair it returns `EOPNOTSUPP`.
 
-## Two open items
+## Three open items
 
+- **The SOCKS5 and HTTP CONNECT paths are unit-tested, not run end to end.**
+  `src/proxy.rs` tests both handshakes against in-memory fakes, which proves the
+  bytes on the wire are well formed but not that a flow completes through a real
+  proxy. I could not close that gap here: `connect` to loopback is `EACCES` in this
+  cage, so a test proxy on `127.0.0.1` is unreachable, and `--proxy` has no
+  `AF_UNIX` form because it takes `HOST:PORT` and a socket path is not one.
+  `probe/s5proxy.c` is a working SOCKS5 server that records the destination it was
+  asked for; it cannot bind TCP here, which is the gap itself rather than a
+  workaround for it. On a host with a reachable proxy this is the first thing to
+  add a test for.
 - **`SECCOMP_IOCTL_NOTIF_ADDFD` works here**, in all four flag combinations. It
   was recorded as unavailable and the pooled-descriptor design was built to route
   around that; the record was a probe bug (`probe/addfd_clean.c`). Migrating to
@@ -167,7 +232,7 @@ Dependencies: `libc` and `nix`. Nothing else.
 
 ## Tests
 
-`cargo test --release` runs 31 tests. Compiled fixtures are **not** committed, so
+`cargo test --release` runs 36 tests. Compiled fixtures are **not** committed, so
 build them once first:
 
 ```

@@ -286,7 +286,7 @@ fn the_relay_carries_bytes_in_both_directions() {
     // the assertion is on bytes the fixture could not have invented.
     let sock_path = format!("/tmp/pod-netns-test-origin-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&sock_path);
-    let mut server = std::os::unix::net::UnixListener::bind(&sock_path)
+    let server = std::os::unix::net::UnixListener::bind(&sock_path)
         .expect("bind the AF_UNIX test origin");
     let origin = std::thread::spawn(move || {
         use std::io::{Read, Write};
