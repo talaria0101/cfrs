@@ -123,6 +123,58 @@ deterministic replay). What is still open, including the single-waker caveat and
 the unwired control server, is listed in §11 of
 [`VIRTUAL-NETWORK.md`](./VIRTUAL-NETWORK.md).
 
+## Tailscale, unpatched
+
+A host that forbids `AF_INET` binds and restricts `AF_INET` connects to a few
+ports can still join a tailnet. `tailscaled --tun=userspace-networking` runs
+the whole stack in userspace, and the one door it always leaves open is its
+`LocalAPI` unix socket. `cfrs net tailscale` puts a SOCKS5 / HTTP `CONNECT`
+front door on an `AF_UNIX` socket and dials every request through the daemon's
+`ts-dial` local API; `cfrs net socksify` builds the shim that redirects an
+unmodified program's `connect(2)` to it. Nothing patches or re-links Tailscale.
+
+```sh
+cfrs net tailscale --socket /run/tailscale/tailscaled.sock \
+                   --listen unix:/run/cfrssocks.sock
+eval "$(cfrs net socksify --proxy /run/cfrssocks.sock)"
+curl http://100.x.y.z:8080/
+```
+
+The daemon can also serve SSH (`tailscaled --ssh`) straight from its netstack,
+which is the way *into* a sealed host. It resolves the login on the local
+system, though, and a sandbox with no `/etc/passwd` and a read-only `/etc` has
+nothing to resolve. `cfrs net ts-shims` writes the two helper commands the
+static Go daemon shells out to (`getent`, `id`) plus an `LD_PRELOAD` table for
+dynamic clients, so the daemon stays untouched:
+
+```sh
+cfrs net ts-shims --out /run/cfrs-ts-shims --user nemo
+PATH=/run/cfrs-ts-shims:$PATH tailscaled --tun=userspace-networking \
+    --statedir /run/cfrs-ts-shims --socket /run/tailscale/tailscaled.sock
+```
+
+An interactive *shell* needs one more step. The daemon is static Go, so it
+cannot be given a userspace pty, and a pty request fails the session; a dynamic
+`sshd` refuses the pty and carries on. `tools/ts-sshd.sh` runs one on a unix
+socket, exposes it with `tailscale serve --tcp`, and gives the login shell
+sandhome's `fakepty` and `errandsh`, so a pty-less session still has echo, a
+prompt and line editing.
+
+The measurements that force this shape, what is proven live, and the limits
+(no UDP, names through `getaddrinfo`, `Dial-Self`) are in
+[`TAILSCALE.md`](./TAILSCALE.md).
+
+## `pod-netns`: proxying without shims
+
+Every interposer above can only reach a *dynamic* binary. `pod-netns` is the
+kernel-enforced answer: it runs a program in a network namespace whose only
+interface is a TUN the parent drives with the `cfrs` userspace stack, so any
+program — static, Go, libc-free — has its egress forced through a SOCKS5/HTTP
+proxy. `pod-netns doctor` measures what the host permits first, and
+`-x tailscale:<socket>` makes the tailnet the transport by dialling the
+daemon's `ts-dial` LocalAPI directly, with no front door and no shim. See
+[`POD-NETNS.md`](./POD-NETNS.md).
+
 ## What was measured, and where the boundary is
 
 Every claim below was measured in the development sandbox on 2026-10-09. The
@@ -375,6 +427,7 @@ removing the fix to confirm the test goes red:
 | `tests/af_inet_kernel.rs` | the kernel files a mapped socket as `AF_UNIX`, measured by socket inode, with the sealed-host control |
 | `tests/shim_direct.rs` | two unmodified programs exchange data over abstract names |
 | `tests/shim_no_socket.rs` | programs that never open a socket keep working |
+| `tests/shim_socks.rs` | an unmodified program's `AF_INET` connect reaches an echo through the tailnet front door |
 | `tests/vnet_regressions.rs` | the UTF-8 truncation panic, the decoder wedge, the socket leak and the poll-interval knob |
 
 `tools/check-header-oracle.sh` is not part of `cargo test`. Run it to rebuild

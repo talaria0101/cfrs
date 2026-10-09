@@ -15,6 +15,16 @@ pub const SHIM_SOURCE: &str = include_str!("../../shim/cfrsnet.c");
 /// The shim's file name on a unix host.
 pub const SHIM_FILE: &str = "libcfrsnet.so";
 
+/// The Tailscale-socksifying shim source, compiled into the binary.
+///
+/// Separate from [`SHIM_SOURCE`]: this one rewrites `connect(2)` to an
+/// `AF_UNIX` SOCKS5 front door for a tailnet address, and leaves every other
+/// socket alone. The abstract-name shim and this one are alternative front
+/// ends, not layers, so they are built and preloaded separately.
+pub const SOCKS_SHIM_SOURCE: &str = include_str!("../../shim/cfrssocks.c");
+/// The socksifying shim's file name on a unix host.
+pub const SOCKS_SHIM_FILE: &str = "libcfrssocks.so";
+
 /// Configuration passed to the shim through the environment.
 #[derive(Clone, Debug)]
 pub struct ShimOptions {
@@ -160,21 +170,64 @@ pub fn locate_or_build(directory: &Path) -> Result<Shim> {
     build(directory)
 }
 
+/// Find an existing socksifying shim, or `None`.
+pub fn locate_socks() -> Option<Shim> {
+    let env_shim = std::env::var("CFRSSOCKS_SHIM")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let mut candidates = Vec::new();
+    if let Some(path) = env_shim.clone() {
+        candidates.push(path);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(SOCKS_SHIM_FILE));
+            candidates.push(dir.join("shim").join(SOCKS_SHIM_FILE));
+        }
+    }
+    candidates.push(PathBuf::from("target/release").join(SOCKS_SHIM_FILE));
+    candidates.push(PathBuf::from("target/debug").join(SOCKS_SHIM_FILE));
+    candidates.push(PathBuf::from("shim").join(SOCKS_SHIM_FILE));
+    for path in candidates {
+        if path.is_file() {
+            let origin = if env_shim.as_deref() == Some(path.as_path()) {
+                ShimOrigin::Environment
+            } else if path.starts_with("target") {
+                ShimOrigin::BuildTree
+            } else {
+                ShimOrigin::Cached
+            };
+            return Some(Shim { path, origin });
+        }
+    }
+    None
+}
+
 /// Compile the embedded shim source into `directory/libcfrsnet.so`.
 pub fn build(directory: &Path) -> Result<Shim> {
+    compile_source(SHIM_SOURCE, SHIM_FILE, directory)
+}
+
+/// Compile the embedded socksifying shim into `directory/libcfrssocks.so`.
+pub fn build_socks(directory: &Path) -> Result<Shim> {
+    compile_source(SOCKS_SHIM_SOURCE, SOCKS_SHIM_FILE, directory)
+}
+
+pub(crate) fn compile_source(source_text: &str, file_name: &str, directory: &Path) -> Result<Shim> {
     std::fs::create_dir_all(directory)
         .with_context(|| format!("creating shim directory {}", directory.display()))?;
-    let source = directory.join("cfrsnet.c");
+    let source = directory.join(file_name.replace(".so", ".c"));
     // Only rewrite when the content differs, so a rebuild loop is cheap and an
     // editor's mtime is not fought.
     let needs_write = std::fs::read(&source)
-        .map(|existing| existing != SHIM_SOURCE.as_bytes())
+        .map(|existing| existing != source_text.as_bytes())
         .unwrap_or(true);
     if needs_write {
-        std::fs::write(&source, SHIM_SOURCE)
+        std::fs::write(&source, source_text)
             .with_context(|| format!("writing shim source {}", source.display()))?;
     }
-    let output = directory.join(SHIM_FILE);
+    let output = directory.join(file_name);
     let cc = compiler()?;
     let mut command = Command::new(&cc);
     command

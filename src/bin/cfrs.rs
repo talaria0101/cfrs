@@ -77,7 +77,10 @@ net SUBCOMMAND:
     cfrs net doctor              Probe what this host permits
     cfrs net addresses           Print the virtual address plan
     cfrs net shim [--out DIR]    Build the LD_PRELOAD shim, print its env
-    cfrs net proxy [OPTIONS]    SOCKS5 / HTTP CONNECT into the virtual net
+    cfrs net proxy [OPTIONS]    SOCKS5 / HTTP CONNECT to a real unix destination
+    cfrs net tailscale [OPTIONS] SOCKS5 / HTTP CONNECT to a tailnet via tailscaled
+    cfrs net socksify [OPTIONS]  Build the shim that redirects tailnet connects
+    cfrs net ts-shims [OPTIONS]  Write the user-table shims Tailscale SSH needs
 
 net shim OPTIONS:
         --out DIR                Where to build when no shim is found
@@ -94,6 +97,31 @@ net proxy OPTIONS:
         --port N                 Default port for clients that omit one
         --run-for SECONDS        Exit after N seconds
 
+net tailscale OPTIONS:
+        --socket PATH            tailscaled LocalAPI socket
+                                  [default: /var/run/tailscale/tailscaled.sock]
+        --listen SPEC            unix:/path or tcp://[bind:]port
+                                  [default: unix:/tmp/cfrssocks.sock]
+        --port N                 Default port for clients that omit one
+        --run-for SECONDS        Exit after N seconds
+
+net socksify OPTIONS:
+        --out DIR                Where to build the shim
+        --proxy PATH             The front door's unix socket
+                                  [default: /tmp/cfrssocks.sock]
+        --log                    Log every redirect to stderr
+        --json                   Print the environment as JSON
+
+net ts-shims OPTIONS:
+        --out DIR                Where to write passwd/group/getent/id/fakepwd.so
+                                  [default: /tmp/cfrs-ts-shims]
+        --user NAME              Local login name [default: $USER]
+        --uid N                  Local uid [default: the current one]
+        --gid N                  Local gid [default: the current one]
+        --shell PATH             Login shell for the synthetic user
+                                  [default: /bin/sh]
+        --json                   Print the client environment as JSON
+
 EXAMPLES:
     cfrs tunnel --url http://localhost:8080
     cfrs tunnel --unix /run/app.sock --protocol http2
@@ -103,6 +131,10 @@ EXAMPLES:
     cfrs net demo
     cfrs net shim --out ./cfrsnet --log
     cfrs net proxy --forward 10.66.0.2:8080=unix:/run/app.sock
+    cfrs net tailscale --socket /run/tailscale/tailscaled.sock
+    eval \"$(cfrs net socksify --proxy /tmp/cfrssocks.sock)\"
+    curl http://100.x.y.z:8080/
+    cfrs net ts-shims --out /run/cfrs-ts-shims
 ";
 
 fn main() -> ExitCode {
@@ -573,6 +605,9 @@ fn cmd_ports() -> Result<(), String> {
 /// Every flag `net` accepts, used to reject typos loudly.
 const NET_FLAGS: &[&str] = &["out", "log", "map-loopback", "json"];
 const NET_PROXY_FLAGS: &[&str] = &["listen", "map", "forward", "port", "run-for"];
+const NET_TAILSCALE_FLAGS: &[&str] = &["socket", "listen", "port", "run-for"];
+const NET_SOCKSIFY_FLAGS: &[&str] = &["out", "proxy", "log", "json"];
+const NET_TS_SHIMS_FLAGS: &[&str] = &["out", "user", "uid", "gid", "shell", "json"];
 
 fn cmd_net(args: &[String]) -> Result<(), String> {
     let Some(sub) = args.first().map(String::as_str) else {
@@ -615,8 +650,11 @@ fn cmd_net(args: &[String]) -> Result<(), String> {
         }
         "shim" => cmd_net_shim(rest),
         "proxy" => cmd_net_proxy(rest),
+        "tailscale" => cmd_net_tailscale(rest),
+        "socksify" => cmd_net_socksify(rest),
+        "ts-shims" => cmd_net_ts_shims(rest),
         other => Err(format!(
-            "unknown net subcommand {other:?}; expected demo, doctor, addresses, shim, proxy"
+            "unknown net subcommand {other:?}; expected demo, doctor, addresses, shim, proxy, tailscale, socksify, ts-shims"
         )),
     }
 }
@@ -791,6 +829,157 @@ impl RealTarget {
             Self::Unix(path) => Ok(Box::new(tokio::net::UnixStream::connect(path).await?)),
         }
     }
+}
+
+fn cmd_net_tailscale(args: &[String]) -> Result<(), String> {
+    use cfrs::vnet::proxy::ProxyListen;
+    use cfrs::vnet::tailscale::{self, Dialer};
+
+    let flags = Flags::parse(args)?;
+    flags.reject_unknown(NET_TAILSCALE_FLAGS)?;
+
+    let socket = flags
+        .get("socket")
+        .unwrap_or(tailscale::DEFAULT_SOCKET)
+        .to_string();
+    let listen = ProxyListen::parse(flags.get("listen").unwrap_or("unix:/tmp/cfrssocks.sock"))
+        .map_err(|e| e.to_string())?;
+    let default_port: u16 = match flags.get("port") {
+        Some(p) => p.parse().map_err(|_| "--port expects a number".to_string())?,
+        None => 80,
+    };
+    let run_for: Option<u64> = match flags.get("run-for") {
+        Some(s) => Some(s.parse().map_err(|_| "--run-for expects seconds".to_string())?),
+        None => None,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    runtime.block_on(async move {
+        let proxy = tailscale::serve(Dialer::new(&socket), listen, default_port)
+            .await
+            .map_err(|e| e.to_string())?;
+        match &proxy.listen {
+            ProxyListen::Unix(path) => println!("cfrs: proxy    unix:{}", path.display()),
+            ProxyListen::Tcp(addr) => println!("cfrs: proxy    tcp://{addr}"),
+        }
+        println!("cfrs: localapi {socket}");
+        println!("cfrs: note     tailscaled must be running with --tun=userspace-networking");
+        println!("cfrs: shim     eval \"$(cfrs net socksify --proxy <listen-path>)\"");
+
+        match run_for {
+            Some(secs) => tokio::time::sleep(std::time::Duration::from_secs(secs)).await,
+            None => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        proxy.abort();
+        Ok(())
+    })
+}
+
+fn cmd_net_ts_shims(args: &[String]) -> Result<(), String> {
+    use cfrs::vnet::tailscale_ssh;
+
+    let flags = Flags::parse(args)?;
+    flags.reject_unknown(NET_TS_SHIMS_FLAGS)?;
+
+    let directory = flags.get("out").map_or_else(
+        || std::env::temp_dir().join("cfrs-ts-shims"),
+        std::path::PathBuf::from,
+    );
+    let mut user = tailscale_ssh::current_user();
+    if let Some(name) = flags.get("user") {
+        user.name = name.to_string();
+    }
+    if let Some(uid) = flags.get("uid") {
+        user.uid = uid.parse().map_err(|_| "--uid expects a number".to_string())?;
+    }
+    if let Some(gid) = flags.get("gid") {
+        user.gid = gid.parse().map_err(|_| "--gid expects a number".to_string())?;
+    }
+    if let Some(shell) = flags.get("shell") {
+        user.shell = shell.to_string();
+    }
+
+    let shims = tailscale_ssh::install(&directory, &[user.clone()])
+        .map_err(|e| e.to_string())?;
+    let environment = tailscale_ssh::client_environment(&shims);
+
+    if flags.present("json") {
+        let object: serde_json::Map<String, serde_json::Value> = environment
+            .into_iter()
+            .map(|(key, value)| (key, serde_json::Value::String(value)))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&object).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    println!("cfrs: shims    {}", shims.dir.display());
+    println!("cfrs: user     {} uid={} gid={}", user.name, user.uid, user.gid);
+    println!("cfrs: passwd   {}", shims.passwd.display());
+    println!("cfrs: fakepwd  {}", shims.fakepwd.display());
+    println!(
+        "cfrs: daemon   PATH={}:$PATH tailscaled ... --statedir {}",
+        shims.dir.display(),
+        shims.dir.display()
+    );
+    println!("cfrs: note     --statedir is what lets the daemon keep SSH host keys");
+    for (key, value) in &environment {
+        println!("  export {key}={value}");
+    }
+    Ok(())
+}
+
+fn cmd_net_socksify(args: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(args)?;
+    flags.reject_unknown(NET_SOCKSIFY_FLAGS)?;
+
+    let directory = flags.get("out").map_or_else(
+        || std::env::temp_dir().join("cfrssocks"),
+        std::path::PathBuf::from,
+    );
+    let shim = match cfrs::vnet::shim::locate_socks() {
+        Some(shim) if !flags.present("out") => shim,
+        _ => cfrs::vnet::shim::build_socks(&directory).map_err(|e| e.to_string())?,
+    };
+    let proxy = flags.get("proxy").unwrap_or("/tmp/cfrssocks.sock");
+
+    let mut environment = vec![(
+        "LD_PRELOAD".to_string(),
+        match std::env::var("LD_PRELOAD") {
+            Ok(existing) if !existing.is_empty() => format!("{}:{existing}", shim.path.display()),
+            _ => shim.path.display().to_string(),
+        },
+    )];
+    environment.push(("CFRSSOCKS_PROXY".to_string(), proxy.to_string()));
+    if flags.present("log") {
+        environment.push(("CFRSSOCKS_LOG".to_string(), "1".to_string()));
+    }
+
+    if flags.present("json") {
+        let object: serde_json::Map<String, serde_json::Value> = environment
+            .into_iter()
+            .map(|(key, value)| (key, serde_json::Value::String(value)))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&object).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    eprintln!("cfrs: shim     {}", shim.path.display());
+    eprintln!("cfrs: origin   {:?}", shim.origin);
+    for (key, value) in &environment {
+        println!("export {key}={value}");
+    }
+    Ok(())
 }
 
 fn resolve_proxy(explicit: Option<&str>) -> Option<String> {

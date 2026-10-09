@@ -978,3 +978,24 @@ difference matters:
   statement that the proxy mode is the only path for them.
 - The control server, which is what would make §6.3's switch mode real rather
   than a codec with no endpoint.
+
+---
+
+## 12. A tailnet as the tunnel, unpatched
+
+§5.4 says the tunnel may be any reliable, ordered byte stream, and §7.2
+sketches "a process-level VPN" where the far side is another machine. One such
+transport already exists and needs no rendezvous of our own: Tailscale's
+userspace netstack. `tailscaled --tun=userspace-networking` runs the stack in
+process — no TUN, no `CAP_NET_ADMIN`, no `AF_INET` bind — and its local API
+(`POST /localapi/v0/dial`, the `ts-dial` upgrade) dials a tailnet address and
+hands back the byte stream.
+
+`cfrs net tailscale` is that bridge: an `AF_UNIX` SOCKS5 / HTTP `CONNECT`
+front door that dials through the daemon's local API, and `shim/cfrssocks.c`
+redirects an unmodified program's `connect(2)` to it for `100.64.0.0/10` and
+`fd7a:115c:a1e0::/48` only. Nothing patches Tailscale. It is the same shape as
+this document's §4 interposition, with the daemon's netstack in place of the
+one in §5, and it exists because a host can permit `AF_UNIX` and forbid the
+`AF_INET` listener the daemon's own `--socks5-server` would use. The
+measurements and the limits are in [`TAILSCALE.md`](./TAILSCALE.md).
